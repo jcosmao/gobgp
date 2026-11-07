@@ -453,6 +453,24 @@ func (peer *peer) negotiatedRFList() []bgp.Family {
 	return l
 }
 
+// toLocalFamily is the reverse of toGlobalFamilies: the family that a VRF
+// neighbor negotiated for the VPN family f.
+func (peer *peer) toLocalFamily(f bgp.Family) bgp.Family {
+	if peer.fsm.pConf.ReadOnly().Config.Vrf != "" {
+		switch f {
+		case bgp.RF_IPv4_VPN:
+			return bgp.RF_IPv4_UC
+		case bgp.RF_IPv6_VPN:
+			return bgp.RF_IPv6_UC
+		case bgp.RF_FS_IPv4_VPN:
+			return bgp.RF_FS_IPv4_UC
+		case bgp.RF_FS_IPv6_VPN:
+			return bgp.RF_FS_IPv6_UC
+		}
+	}
+	return f
+}
+
 func (peer *peer) toGlobalFamilies(families []bgp.Family) []bgp.Family {
 	conf := peer.fsm.pConf.ReadOnly()
 	if conf.Config.Vrf != "" {

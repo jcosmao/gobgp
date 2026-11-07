@@ -1259,7 +1259,8 @@ func (s *BgpServer) notifyRecvMessageWatcher(peer *peer, timestamp time.Time, pa
 }
 
 func (s *BgpServer) getPossibleBest(peer *peer, family bgp.Family) []*table.Path {
-	if peer.isAddPathSendEnabled(family) {
+	// A VRF neighbor negotiates ADD-PATH for the VRF family, not the VPN one.
+	if peer.isAddPathSendEnabled(peer.toLocalFamily(family)) {
 		return peer.localRib.GetPathList(peer.TableID(), peer.AS(), []bgp.Family{family})
 	}
 	return peer.localRib.GetBestPathList(peer.TableID(), peer.AS(), []bgp.Family{family})
@@ -1310,7 +1311,7 @@ func (s *BgpServer) getBestFromLocalCallbackLocked(peer *peer, rfList []bgp.Fami
 	} else {
 		for _, family := range peer.toGlobalFamilies(rfList) {
 			var candidates []*table.Path
-			if vrf, ok := peer.localRib.GetVrf(peer.fsm.pConf.ReadOnly().Config.Vrf); !ok || fullScan || peer.isAddPathSendEnabled(family) {
+			if vrf, ok := peer.localRib.GetVrf(peer.fsm.pConf.ReadOnly().Config.Vrf); !ok || fullScan || peer.isAddPathSendEnabled(peer.toLocalFamily(family)) {
 				candidates = s.getPossibleBest(peer, family)
 			} else {
 				candidates = peer.localRib.GetBestPathListByVrf(peer.TableID(), peer.AS(), vrf, []bgp.Family{family})
