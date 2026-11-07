@@ -1256,7 +1256,8 @@ func (s *BgpServer) notifyRecvMessageWatcher(peer *peer, timestamp time.Time, pa
 }
 
 func (s *BgpServer) getPossibleBest(peer *peer, family bgp.Family) []*table.Path {
-	if peer.isAddPathSendEnabled(family) {
+	// A VRF neighbor negotiates ADD-PATH for the VRF family, not the VPN one.
+	if peer.isAddPathSendEnabled(peer.toLocalFamily(family)) {
 		return peer.localRib.GetPathList(peer.TableID(), peer.AS(), []bgp.Family{family})
 	}
 	return peer.localRib.GetBestPathList(peer.TableID(), peer.AS(), []bgp.Family{family})
