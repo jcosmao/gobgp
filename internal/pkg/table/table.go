@@ -22,6 +22,7 @@ import (
 	"math/bits"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -329,7 +330,8 @@ type Table struct {
 	// this is a map[rt, MAC address]map[addrPrefixKey][]nlri
 	// this holds a map for a set of prefixes.
 	macIndex *EVPNMacNLRIs
-	// vpnIdx indexes all known paths by Route Target for O(1) RT-based lookup.
+	// vpnIdx indexes known paths by Route Target, enough of them to find every
+	// destination with a path carrying a given Route Target (see vpnIndexed).
 	// Non-nil only for families that carry RT extended communities (VPNV4-6, EVPN, ...).
 	vpnIdx *VPNPathIndex
 }
@@ -581,46 +583,108 @@ func (t *Table) update(newPath *Path, selectionOptions oc.RouteSelectionOptionsC
 		}
 	}
 
-	t.updateVPNIdx(u, newPath, oldPath)
+	t.updateVPNIdx(u)
 	return u
 }
 
-// updateVPNIdx keeps the vpnIdx in sync with the VPN path table after each
-// update. It must be called immediately after dst.Calculate so that
-// OldKnownPathList and KnownPathList reflect the state before and after the
-// change respectively.
-func (t *Table) updateVPNIdx(u *Update, newPath, oldPath *Path) {
+// updateVPNIdx keeps vpnIdx in sync with the table: it must be called right
+// after dst.Calculate. See vpnIndexed for the paths the index holds.
+func (t *Table) updateVPNIdx(u *Update) {
 	if t.vpnIdx == nil {
 		return
 	}
-	if newPath.RemoteID() != 0 {
-		// ADD-PATH: each (source, path-ID) pair is a distinct entry.
-		// oldPath is the previous path with the same (source, path-ID) returned by
-		// implicitWithdraw (non-withdrawal) or explicitWithdraw (withdrawal).
-		t.vpnIdx.UnregisterPath(oldPath)
-		if !newPath.IsWithdraw {
-			t.vpnIdx.RegisterPath(newPath)
+	before, after := vpnIndexed(u.OldKnownPathList), vpnIndexed(u.KnownPathList)
+	// Unregister first: the old and new path may share the same index key.
+	for _, p := range before {
+		if !slices.Contains(after, p) {
+			t.vpnIdx.UnregisterPath(p)
 		}
 	}
-	// No-add-path: track only the best path per NLRI. The best may also change
-	// on an ADD-PATH update, for example when an ADD-PATH best is withdrawn.
-	// ADD-PATH paths are indexed above, whether they are best or not.
-	// KnownPathList is sorted by computeKnownBestPath, so [0] is the best.
-	var oldBest, newBest *Path
-	if len(u.OldKnownPathList) > 0 {
-		oldBest = u.OldKnownPathList[0]
-	}
-	if len(u.KnownPathList) > 0 {
-		newBest = u.KnownPathList[0]
-	}
-	if oldBest != newBest {
-		if oldBest != nil && oldBest.RemoteID() == 0 {
-			t.vpnIdx.UnregisterPath(oldBest)
-		}
-		if newBest != nil && newBest.RemoteID() == 0 {
-			t.vpnIdx.RegisterPath(newBest)
+	for _, p := range after {
+		if !slices.Contains(before, p) {
+			t.vpnIdx.RegisterPath(p)
 		}
 	}
+}
+
+// vpnIndexed returns the known paths of a destination that vpnIdx holds: the
+// paths carrying a Route Target that no previous path carries. Each Route
+// Target of the destination is then found through the index, and when its
+// paths carry the same Route Targets (redundant route reflectors, several
+// PEs), only one is indexed.
+func vpnIndexed(known []*Path) []*Path {
+	var l []*Path
+	var buf [8]uint64
+	seen := buf[:0]
+	for _, p := range known {
+		add := false
+		for _, ec := range p.GetExtCommunities() {
+			if !isRouteTarget(ec) {
+				continue
+			}
+			if k, err := bgp.ExtCommRouteTargetKey(ec); err == nil && !slices.Contains(seen, k) {
+				seen = append(seen, k)
+				add = true
+			}
+		}
+		if add {
+			l = append(l, p)
+		}
+	}
+	return l
+}
+
+// forEachDestinationByRT calls fn, holding the shard read lock, once for each
+// destination that has a known path carrying one of rts.
+func (t *Table) forEachDestinationByRT(rts []bgp.ExtendedCommunityInterface, fn func(*destination)) {
+	seen := map[*destination]struct{}{}
+	for _, rt := range rts {
+		for _, p := range t.vpnIdx.GetPathsByRT(rt) {
+			nlri := p.GetNlri()
+			shard := t.destinations.getShard(nlri)
+			if shard == nil {
+				continue
+			}
+			shard.mu.RLock()
+			for _, d := range shard.mp[tableKey(nlri)] {
+				if AddrPrefixOnlyCompare(d.nlri, nlri) == 0 {
+					if _, ok := seen[d]; !ok {
+						seen[d] = struct{}{}
+						fn(d)
+					}
+					break
+				}
+			}
+			shard.mu.RUnlock()
+		}
+	}
+}
+
+// pathsByRT returns, among the paths carrying rt, the best path of each
+// destination and the paths received with ADD-PATH: what RTC redistributes.
+func (t *Table) pathsByRT(rt bgp.ExtendedCommunityInterface) []*Path {
+	key, err := bgp.ExtCommRouteTargetKey(rt)
+	if t.vpnIdx == nil || err != nil {
+		return nil
+	}
+	var paths []*Path
+	t.forEachDestinationByRT([]bgp.ExtendedCommunityInterface{rt}, func(d *destination) {
+		for i, p := range d.knownPathList {
+			if (i == 0 || p.RemoteID() != 0) && hasRouteTarget(p, key) {
+				paths = append(paths, p)
+			}
+		}
+	})
+	return paths
+}
+
+func hasRouteTarget(p *Path, key uint64) bool {
+	for _, ec := range p.GetRouteTargets() {
+		if k, err := bgp.ExtCommRouteTargetKey(ec); err == nil && k == key {
+			return true
+		}
+	}
+	return false
 }
 
 // GetDestinations returns snapshots of all destinations in the table.
@@ -833,42 +897,40 @@ func (t *Table) Bests(id string, as uint32) []*Path {
 }
 
 // BestsByVrf returns the paths of Bests(id, as) that vrf imports. It finds
-// them through the import Route Targets of vrf in vpnIdx, which holds the best
-// path of each destination, instead of walking the whole table.
+// them through the import Route Targets of vrf in vpnIdx instead of walking
+// the whole table.
 func (t *Table) BestsByVrf(id string, as uint32, vrf *Vrf) []*Path {
-	if t.vpnIdx == nil {
-		var paths []*Path
-		for _, p := range t.Bests(id, as) {
-			if CanImportToVrf(vrf, p) {
+	return t.pathsByVrf(id, as, vrf, true)
+}
+
+// KnownPathsByVrf returns the paths of GetKnownPathList(id, as) that vrf
+// imports, as BestsByVrf does.
+func (t *Table) KnownPathsByVrf(id string, as uint32, vrf *Vrf) []*Path {
+	return t.pathsByVrf(id, as, vrf, false)
+}
+
+func (t *Table) pathsByVrf(id string, as uint32, vrf *Vrf, onlyBest bool) []*Path {
+	var paths []*Path
+	add := func(l ...*Path) {
+		for _, p := range l {
+			if p != nil && CanImportToVrf(vrf, p) {
 				paths = append(paths, p)
 			}
 		}
-		return paths
 	}
-	var paths []*Path
-	seen := map[*destination]struct{}{}
-	for _, rt := range vrf.ImportRt.ToSlice() {
-		for _, indexed := range t.vpnIdx.GetPathsByRT(rt) {
-			nlri := indexed.GetNlri()
-			shard := t.destinations.getShard(nlri)
-			if shard == nil {
-				continue
+	switch {
+	case t.vpnIdx == nil && onlyBest:
+		add(t.Bests(id, as)...)
+	case t.vpnIdx == nil:
+		add(t.GetKnownPathList(id, as)...)
+	default:
+		t.forEachDestinationByRT(vrf.ImportRt.ToSlice(), func(d *destination) {
+			if onlyBest {
+				add(d.GetBestPath(id, as))
+			} else {
+				add(d.GetKnownPathList(id, as)...)
 			}
-			shard.mu.RLock()
-			for _, d := range shard.mp[tableKey(nlri)] {
-				if AddrPrefixOnlyCompare(d.nlri, nlri) != 0 {
-					continue
-				}
-				if _, ok := seen[d]; !ok {
-					seen[d] = struct{}{}
-					if p := d.GetBestPath(id, as); p != nil && CanImportToVrf(vrf, p) {
-						paths = append(paths, p)
-					}
-				}
-				break
-			}
-			shard.mu.RUnlock()
-		}
+		})
 	}
 	return paths
 }

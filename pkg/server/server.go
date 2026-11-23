@@ -1279,9 +1279,8 @@ func (s *BgpServer) getBestFromLocalCallback(peer *peer, rfList []bgp.Family, ad
 }
 
 // getBestFromLocalCallbackLocked calls fn with the paths to advertise and the
-// rejected ones. For a VRF neighbor, unless fullScan is set or
-// getPossibleBest returns every path, only the best paths imported by the VRF
-// are considered, so the rejected ones are incomplete.
+// rejected ones. For a VRF neighbor, unless fullScan is set, only the paths
+// imported by the VRF are considered, so the rejected ones are incomplete.
 func (s *BgpServer) getBestFromLocalCallbackLocked(peer *peer, rfList []bgp.Family, addEOR, fullScan bool, fn func([]*table.Path, []*table.Path)) {
 	pathList := []*table.Path{}
 	filtered := []*table.Path{}
@@ -1311,9 +1310,13 @@ func (s *BgpServer) getBestFromLocalCallbackLocked(peer *peer, rfList []bgp.Fami
 	} else {
 		for _, family := range peer.toGlobalFamilies(rfList) {
 			var candidates []*table.Path
-			if vrf, ok := peer.localRib.GetVrf(peer.fsm.pConf.ReadOnly().Config.Vrf); !ok || fullScan || peer.isAddPathSendEnabled(peer.toLocalFamily(family)) {
+			vrf, ok := peer.localRib.GetVrf(peer.fsm.pConf.ReadOnly().Config.Vrf)
+			switch {
+			case !ok || fullScan:
 				candidates = s.getPossibleBest(peer, family)
-			} else {
+			case peer.isAddPathSendEnabled(peer.toLocalFamily(family)):
+				candidates = peer.localRib.GetPathListByVrf(peer.TableID(), peer.AS(), vrf, []bgp.Family{family})
+			default:
 				candidates = peer.localRib.GetBestPathListByVrf(peer.TableID(), peer.AS(), vrf, []bgp.Family{family})
 			}
 			for _, path := range candidates {

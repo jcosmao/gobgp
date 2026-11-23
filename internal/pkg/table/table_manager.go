@@ -456,8 +456,9 @@ func (manager *TableManager) updateMaxPathCounted(pathCount int) {
 	}
 }
 
-// GetPathsByRT returns all paths indexed under rt across all tables in rfList.
-// If rt is nil, returns nil.
+// GetPathsByRT returns the paths carrying rt that RTC redistributes, across
+// all tables in rfList: the best path of each destination and the paths
+// received with ADD-PATH. If rt is nil, returns nil.
 // Only tables with a VPNPathIndex (VPN, EVPN, ...) contribute results.
 func (manager *TableManager) GetPathsByRT(rt bgp.ExtendedCommunityInterface, rfList []bgp.Family) []*Path {
 	if rt == nil {
@@ -468,9 +469,7 @@ func (manager *TableManager) GetPathsByRT(rt bgp.ExtendedCommunityInterface, rfL
 
 	var paths []*Path
 	for _, t := range manager.getTables(rfList...) {
-		if idx := t.GetVPNIndex(); idx != nil {
-			paths = append(paths, idx.GetPathsByRT(rt)...)
-		}
+		paths = append(paths, t.pathsByRT(rt)...)
 	}
 	return paths
 }
@@ -502,6 +501,17 @@ func (manager *TableManager) GetBestPathListByVrf(id string, as uint32, vrf *Vrf
 	var paths []*Path
 	for _, t := range manager.getTables(rfList...) {
 		paths = append(paths, t.BestsByVrf(id, as, vrf)...)
+	}
+	return paths
+}
+
+// GetPathListByVrf returns the paths of GetPathList that vrf imports.
+func (manager *TableManager) GetPathListByVrf(id string, as uint32, vrf *Vrf, rfList []bgp.Family) []*Path {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	var paths []*Path
+	for _, t := range manager.getTables(rfList...) {
+		paths = append(paths, t.KnownPathsByVrf(id, as, vrf)...)
 	}
 	return paths
 }

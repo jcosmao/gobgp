@@ -64,3 +64,23 @@ func BenchmarkVrfNeighborDump(b *testing.B) {
 		})
 	}
 }
+
+// Same, to a neighbor with ADD-PATH send, which gets every path the VRF
+// imports and not only the best ones.
+func BenchmarkVrfNeighborDumpAddPath(b *testing.B) {
+	s, peers := newVrfNeighbors(b, 100, 1, 10000)
+	setAddPathSend(peers[0])
+	for _, mode := range []struct {
+		name     string
+		fullScan bool
+	}{{"full-scan", true}, {"rt-index", false}} {
+		b.Run(mode.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				if paths, _ := vrfDump(s, peers[0], mode.fullScan); len(paths) != 10000 {
+					b.Fatalf("got %d paths", len(paths))
+				}
+			}
+		})
+	}
+}

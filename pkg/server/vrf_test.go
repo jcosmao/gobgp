@@ -208,6 +208,31 @@ func TestVrfNeighborDumpMatchesFullScan(t *testing.T) {
 	require.ElementsMatch(t, pathStrings(full), pathStrings(indexed))
 }
 
+// Same with ADD-PATH send: every path the VRF imports, not only the best ones.
+// 30.0.0.3 is found although its best path does not carry the RT of vrf0.
+func TestVrfNeighborDumpAddPathMatchesFullScan(t *testing.T) {
+	const nVrf, routesPerVrf = 5, 50
+	s, peers := newVrfNeighbors(t, nVrf, 1, routesPerVrf)
+	setAddPathSend(peers[0])
+	rd := bgp.NewRouteDistinguisherTwoOctetAS(65000, 99)
+	withSource := func(p *table.Path, src string, id uint32) *table.Path {
+		a := netip.MustParseAddr(src)
+		return table.NewPath(p.GetFamily(), &table.PeerInfo{Address: a, ID: a}, bgp.PathNLRI{NLRI: p.GetNlri(), ID: id}, false, p.GetPathAttrs(), p.GetTimestamp(), false)
+	}
+	s.propagateUpdate(nil, []*table.Path{
+		newVPNPathForTest(t, netip.MustParsePrefix("30.0.0.1/32"), rd, vrfRT(1), vrfRT(0)),
+		newVPNPathForTest(t, netip.MustParsePrefix("30.0.0.2/32"), rd, vrfRT(2), vrfRT(3)),
+		withSource(newVPNPathForTest(t, netip.MustParsePrefix("30.0.0.3/32"), rd, vrfRT(1)), "9.9.9.1", 0),
+		withSource(newVPNPathForTest(t, netip.MustParsePrefix("30.0.0.3/32"), rd, vrfRT(0)), "9.9.9.2", 0),
+		withSource(newVPNPathForTest(t, netip.MustParsePrefix("30.0.0.4/32"), rd, vrfRT(0)), "9.9.9.1", 1),
+		withSource(newVPNPathForTest(t, netip.MustParsePrefix("30.0.0.4/32"), rd, vrfRT(0)), "9.9.9.1", 2),
+	})
+	indexed, _ := vrfDump(s, peers[0], false)
+	full, _ := vrfDump(s, peers[0], true)
+	require.Len(t, indexed, routesPerVrf+4)
+	require.ElementsMatch(t, pathStrings(full), pathStrings(indexed))
+}
+
 // Soft reset out keeps the full scan: a path that lost the RT of the VRF must
 // be withdrawn.
 func TestVrfNeighborSoftResetOutWithdrawsLostRT(t *testing.T) {
