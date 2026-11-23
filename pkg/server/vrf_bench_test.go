@@ -26,6 +26,26 @@ func BenchmarkVrfNeighborsInject(b *testing.B) {
 	}
 }
 
+// Same, with ADD-PATH send on every VRF neighbor.
+func BenchmarkVrfNeighborsInjectAddPath(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("vrf-neighbors=%d", n), func(b *testing.B) {
+			s, peers := newVrfNeighbors(b, n, n, 0)
+			for _, p := range peers {
+				setAddPathSend(p)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := range b.N {
+				v := i % n
+				rd := bgp.NewRouteDistinguisherTwoOctetAS(65000, uint32(v))
+				prefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{20, byte(i >> 16), byte(i >> 8), byte(i)}), 32)
+				s.propagateUpdate(nil, []*table.Path{newVPNPathForTest(b, prefix, rd, vrfRT(v))})
+			}
+		})
+	}
+}
+
 // Cost of advertising its VRF to one neighbor (session up, graceful restart
 // release, route refresh): 100 VRFs of 10000 routes.
 func BenchmarkVrfNeighborDump(b *testing.B) {

@@ -93,6 +93,14 @@ func newVrfNeighbors(tb testing.TB, nVrf, nPeer, routesPerVrf int) (*BgpServer, 
 	return s, peers
 }
 
+// setAddPathSend enables ADD-PATH send for IPv4 unicast on p.
+func setAddPathSend(p *peer) {
+	for i := range p.fsm.pConf.ReadOnly().AfiSafis {
+		p.fsm.pConf.ReadOnly().AfiSafis[i].AddPaths.Config.SendMax = 8
+	}
+	p.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND})
+}
+
 // An injected path reaches exactly the VRF neighbors whose VRF imports it.
 func TestVrfNeighborsInject(t *testing.T) {
 	s, peers := newVrfNeighbors(t, 3, 3, 0)
@@ -117,14 +125,21 @@ func TestVrfNeighborsInject(t *testing.T) {
 	require.Equal(t, []bool{true, false, false}, sent(x))
 }
 
-// A VRF neighbor with ADD-PATH send is not skipped: it still gets a path its
-// VRF imports when that path is not the best one of its prefix.
+// A VRF neighbor with ADD-PATH send gets a path its VRF imports when that
+// path is not the best one of its prefix. A path and its withdrawal reach only
+// the ADD-PATH VRF neighbors whose VRF imports that path.
 func TestVrfNeighborsInjectAddPath(t *testing.T) {
-	s, peers := newVrfNeighbors(t, 2, 1, 0)
-	for i := range peers[0].fsm.pConf.ReadOnly().AfiSafis {
-		peers[0].fsm.pConf.ReadOnly().AfiSafis[i].AddPaths.Config.SendMax = 8
+	s, peers := newVrfNeighbors(t, 3, 3, 0)
+	for _, p := range peers {
+		setAddPathSend(p)
 	}
-	peers[0].fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND})
+	sent := func(p *table.Path) []bool {
+		l := make([]bool, len(peers))
+		for i, peer := range peers {
+			l[i] = peer.hasPathAlreadyBeenSent(p.ToLocal())
+		}
+		return l
+	}
 	rd := bgp.NewRouteDistinguisherTwoOctetAS(65000, 99)
 	prefix := netip.MustParsePrefix("30.0.0.1/32")
 	path := func(id uint32, rt bgp.ExtendedCommunityInterface) *table.Path {
@@ -136,7 +151,12 @@ func TestVrfNeighborsInjectAddPath(t *testing.T) {
 	imported := path(2, vrfRT(0))
 	s.propagateUpdate(nil, []*table.Path{best})
 	s.propagateUpdate(nil, []*table.Path{imported})
-	require.True(t, peers[0].hasPathAlreadyBeenSent(imported.ToLocal()))
+	require.Equal(t, []bool{true, false, false}, sent(imported))
+	require.Equal(t, []bool{false, true, false}, sent(best))
+
+	s.propagateUpdate(nil, []*table.Path{imported.Clone(true)})
+	require.Equal(t, []bool{false, false, false}, sent(imported))
+	require.Equal(t, []bool{false, true, false}, sent(best))
 }
 
 func vrfDump(s *BgpServer, p *peer, fullScan bool) (paths, filtered []*table.Path) {

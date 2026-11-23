@@ -1719,10 +1719,33 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 	// A VRF neighbor gets only the VPN paths its VRF imports (see
 	// prePolicyFilterpath). Find those VRFs once instead of filtering every
 	// VRF neighbor.
-	var importers map[string]*table.Vrf
+	var importers, addPathImporters map[string]*table.Vrf
+	isVPN := false
 	switch family {
 	case bgp.RF_IPv4_VPN, bgp.RF_IPv6_VPN, bgp.RF_FS_IPv4_VPN, bgp.RF_FS_IPv6_VPN:
+		isVPN = true
 		importers = rib.GetImportingVrfs(gBestList...)
+	}
+	addPathImportersDone := false
+	// A neighbor with ADD-PATH send gets newPath, or the paths it withdraws,
+	// whether they are the best or not.
+	getAddPathImporters := func() map[string]*table.Vrf {
+		if !addPathImportersDone {
+			addPathImportersDone = true
+			if !isVPN {
+				return nil
+			}
+			if !newPath.IsWithdraw {
+				addPathImporters = rib.GetImportingVrfs(newPath)
+			} else {
+				var withdrawn []*table.Path
+				for _, d := range dsts {
+					withdrawn = append(withdrawn, d.GetWithdrawnPath()...)
+				}
+				addPathImporters = rib.GetImportingVrfs(withdrawn...)
+			}
+		}
+		return addPathImporters
 	}
 	for _, targetPeer := range s.neighborMap {
 		if source == nil && targetPeer.isRouteServerClient() || source != nil && source.isRouteServerClient() != targetPeer.isRouteServerClient() {
@@ -1746,9 +1769,12 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 			return family
 		}()
 
-		// A neighbor with ADD-PATH send may get paths that are not the best.
-		if vrf := targetPeer.fsm.pConf.ReadOnly().Config.Vrf; vrf != "" && !targetPeer.isRouteServerClient() && !targetPeer.isAddPathSendEnabled(f) {
-			if _, ok := importers[vrf]; !ok {
+		if vrf := targetPeer.fsm.pConf.ReadOnly().Config.Vrf; vrf != "" && !targetPeer.isRouteServerClient() {
+			m := importers
+			if targetPeer.isAddPathSendEnabled(f) {
+				m = getAddPathImporters()
+			}
+			if _, ok := m[vrf]; !ok {
 				continue
 			}
 		}
